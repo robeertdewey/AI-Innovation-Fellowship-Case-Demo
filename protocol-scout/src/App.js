@@ -1,5 +1,9 @@
+// Core React hooks and jsPDF for client‑side PDF generation.
 import { useState, useRef, useEffect } from "react";
+import { jsPDF } from "jspdf";
 
+// System prompt that defines the "agent" persona and the JSON contract
+// for protocol analysis. This is sent as the `system` message to Anthropic.
 const SYSTEM_PROMPT = `You are a senior research scientist and protocol quality reviewer with 15 years of experience in immunoassay development and laboratory best practices. You are reviewing a protocol for a small biotech team preparing for IND-enabling studies.
 
 Your job is to analyze the protocol step-by-step and identify risks that could cause experimental failure, data invalidation, or irreproducibility. For each issue you find, you must:
@@ -27,25 +31,33 @@ Flag schema:
 
 No preamble, no markdown fences, just the raw JSON object.`;
 
+// Visual configuration for how each flag type is rendered in the UI.
 const FLAG_CONFIG = {
   AMBIGUITY: { label: "Ambiguity", color: "#c8891a", bg: "#fef3dc", border: "#f5c842" },
   MISSING_CONTROL: { label: "Missing Control", color: "#b94040", bg: "#fdeaea", border: "#e88080" },
   REPRODUCIBILITY_RISK: { label: "Reproducibility Risk", color: "#2c6e9e", bg: "#e8f2fb", border: "#7ab8e8" },
 };
 
+// Visual configuration for severity badges (HIGH / MEDIUM / LOW).
 const SEVERITY_CONFIG = {
   HIGH: { label: "HIGH", color: "#b94040", bg: "#fdeaea" },
   MEDIUM: { label: "MED", color: "#c8891a", bg: "#fef3dc" },
   LOW: { label: "LOW", color: "#2c6e9e", bg: "#e8f2fb" },
 };
 
+// Main ProtocolScout application component. Coordinates file upload,
+// agent call, triage UI, live protocol updates, and PDF export.
 export default function App() {
+  // High‑level UI stage: upload → analyzing → results.
   const [stage, setStage] = useState("upload");
+  // Flags and analysis state returned by the agent.
   const [flags, setFlags] = useState([]);
   const [thinkingLines, setThinkingLines] = useState([]);
   const [activeFlag, setActiveFlag] = useState(null);
+  // User triage state for each flag.
   const [dismissed, setDismissed] = useState(new Set());
   const [accepted, setAccepted] = useState(new Set());
+  // File / protocol state and transient UI error.
   const [error, setError] = useState(null);
   const [pdfFile, setPdfFile] = useState(null);
   const [pdfBase64, setPdfBase64] = useState(null);
@@ -54,12 +66,15 @@ export default function App() {
   const thinkingRef = useRef(null);
   const fileInputRef = useRef(null);
 
+  // Keep the "thinking" log scrolled to the bottom while the agent runs.
   useEffect(() => {
     if (thinkingRef.current) {
       thinkingRef.current.scrollTop = thinkingRef.current.scrollHeight;
     }
   }, [thinkingLines]);
 
+  // Read a File object as base64 (without the data: prefix) so it can be
+  // sent to Anthropic as a `document` input.
   const readFileAsBase64 = (file) =>
     new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -68,6 +83,7 @@ export default function App() {
       reader.readAsDataURL(file);
     });
 
+  // Validate and ingest a user‑selected PDF file.
   const handleFile = async (file) => {
     if (!file) return;
     if (file.type !== "application/pdf") { setError("Please upload a PDF file."); return; }
@@ -78,12 +94,16 @@ export default function App() {
     setPdfBase64(b64);
   };
 
+  // Drag‑and‑drop wrapper that feeds into handleFile.
   const handleDrop = async (e) => {
     e.preventDefault();
     setIsDragging(false);
     await handleFile(e.dataTransfer.files[0]);
   };
 
+  // Main agent call: send the PDF to Anthropic with SYSTEM_PROMPT,
+  // parse the JSON response into protocol text + flags, and move
+  // the UI into the results stage.
   const analyze = async () => {
     if (!pdfBase64) return;
     setStage("analyzing");
@@ -168,22 +188,113 @@ export default function App() {
     }
   };
 
+  // Mark a flag as dismissed (and ensure it is not accepted).
   const toggleDismiss = (i) => {
     setDismissed((p) => { const n = new Set(p); n.has(i) ? n.delete(i) : n.add(i); return n; });
     setAccepted((p) => { const n = new Set(p); n.delete(i); return n; });
   };
+  // Mark a flag as accepted (and ensure it is not dismissed).
   const toggleAccept = (i) => {
     setAccepted((p) => { const n = new Set(p); n.has(i) ? n.delete(i) : n.add(i); return n; });
     setDismissed((p) => { const n = new Set(p); n.delete(i); return n; });
   };
 
+  // Reset all analysis state back to the initial upload screen.
   const resetApp = () => {
     setStage("upload"); setFlags([]); setDismissed(new Set()); setAccepted(new Set());
     setActiveFlag(null); setPdfFile(null); setPdfBase64(null); setProtocolText(""); setError(null);
   };
 
+  // Raw protocol lines as returned by the agent (not yet updated).
   const protocolLines = protocolText ? protocolText.split("\n") : [];
-  // For each flag, find the last protocol line that overlaps with its quoted text, so we show the flag after the full step.
+  // Live "displayed" protocol lines with all accepted fixes applied in place.
+  // This is the single source of truth for what the user sees and exports.
+  const displayedLines = (() => {
+    if (!protocolText) return [];
+    const lines = protocolText.split("\n");
+    const stepHeaderRe = /^(\s*Step\s+\d+[.:]\s*|\s*\d+\.\s*)/i;
+    const stripStepFromSuggestion = (text) => String(text).replace(/^\s*Step\s+\d+[.:]\s*/i, "").replace(/^\s*\d+\.\s*/, "").trim();
+    flags.forEach((f, fi) => {
+      if (!accepted.has(fi) || !f.quoted_text || !f.suggested_rewrite) return;
+      try {
+        const q = String(f.quoted_text);
+        const snippet = q.slice(0, Math.min(60, q.length)).trim();
+        const relaxed = snippet.replace(/[.:]+$/, "").trim();
+        const stepNo = f.step_number != null ? String(f.step_number) : null;
+
+        // First, if we have a step_number, try to update the entire process step
+        // block (header + following lines until the next step header).
+        if (stepNo) {
+          for (let i = 0; i < lines.length; i++) {
+            const s = lines[i] != null ? String(lines[i]) : "";
+            const trimmed = s.trim();
+            if (!trimmed) continue;
+            if (/^Step\s+\d+/i.test(trimmed) || /^\d+\./.test(trimmed)) {
+              const numMatch = trimmed.match(/^Step\s+(\d+)/i) || trimmed.match(/^(\d+)\./);
+              if (numMatch && numMatch[1] === stepNo) {
+                const match = s.match(stepHeaderRe);
+                const keepHeader = match ? match[1] : "";
+                const bodyOnly = stripStepFromSuggestion(f.suggested_rewrite) || "";
+                // Find the end of this step block (up to but not including next header).
+                let end = i;
+                for (let k = i + 1; k < lines.length; k++) {
+                  const t = lines[k] != null ? String(lines[k]) : "";
+                  const tTrim = t.trim();
+                  if (!tTrim) { end = k; continue; }
+                  if (/^Step\s+\d+/i.test(tTrim) || /^\d+\./.test(tTrim)) break;
+                  end = k;
+                }
+                // Replace the whole block with a single updated step line.
+                lines.splice(i, end - i + 1, (keepHeader + bodyOnly).trim());
+                // We updated this step from its canonical header; move to next flag.
+                return;
+              }
+            }
+          }
+        }
+
+        for (let i = 0; i < lines.length; i++) {
+          const s = lines[i] != null ? String(lines[i]) : "";
+          if (!s) continue;
+          if (s.includes(snippet) || (relaxed && s.includes(relaxed))) {
+            const match = s.match(stepHeaderRe);
+            const keepHeader = match ? match[1] : "";
+            const bodyOnly = stripStepFromSuggestion(f.suggested_rewrite) || "";
+            if (keepHeader) {
+              lines[i] = (keepHeader + bodyOnly).trim();
+            } else {
+              const replaced = s.replace(snippet || relaxed, bodyOnly);
+              lines[i] = replaced !== s ? replaced : bodyOnly;
+            }
+            break;
+          }
+        }
+      } catch (_) {
+        // If one flag's replacement fails, skip it so displayedLines and export still work
+      }
+    });
+    return lines;
+  })();
+  // For each displayed line, compute the last line index of the "step"
+  // (steps start with "Step N:" or "N.") that contains it.
+  const stepEndByLine = (() => {
+    const result = [];
+    let stepStart = 0;
+    const isStepStart = (s) => /^\s*Step\s+\d+/i.test(s) || /^\s*\d+\.\s+\S/.test(s);
+    for (let i = 0; i < displayedLines.length; i++) {
+      const s = (displayedLines[i] != null ? String(displayedLines[i]) : "").trim();
+      if (i > stepStart && isStepStart(s)) {
+        const stepEnd = i - 1;
+        for (let j = stepStart; j <= stepEnd; j++) result[j] = stepEnd;
+        stepStart = i;
+      }
+    }
+    const stepEnd = displayedLines.length - 1;
+    for (let j = stepStart; j <= stepEnd; j++) result[j] = stepEnd;
+    return result;
+  })();
+  // For each flag, find the last displayed line that overlaps its quoted text,
+  // then anchor the flag to the end of the *step* that contains that line.
   const lastLineForFlag = (() => {
     const out = {};
     flags.forEach((f, fi) => {
@@ -191,28 +302,207 @@ export default function App() {
       const q = f.quoted_text;
       const head = q.slice(0, 20);
       const tail = q.length > 20 ? q.slice(-20) : q;
-      let last = -1;
-      protocolLines.forEach((line, i) => {
+      let lastOverlap = -1;
+      displayedLines.forEach((line, i) => {
         const s = line != null ? String(line) : "";
-        if (s.includes(head) || s.includes(tail) || (q.length <= 40 && s.includes(q))) last = i;
+        if (s.includes(head) || s.includes(tail) || (q.length <= 40 && s.includes(q))) lastOverlap = i;
       });
-      out[fi] = last;
+      out[fi] = lastOverlap >= 0 && stepEndByLine[lastOverlap] !== undefined ? stepEndByLine[lastOverlap] : lastOverlap;
     });
     return out;
   })();
-  const getFlagsToShowAfterLine = (lineIndex) =>
-    flags.filter((_, fi) => lastLineForFlag[fi] === lineIndex);
-  // Order risk flags by position in the procedure (earlier steps first).
-  const sortedFlagIndices = flags
-    .map((_, fi) => fi)
+  // Choose at most ONE primary flag per step (by severity, then first occurrence),
+  // so that each step only surfaces a single canonical issue.
+  const chosenFlagIndexByStepEnd = (() => {
+    const severityRank = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+    const byStep = {};
+    flags.forEach((f, fi) => {
+      const stepEnd = lastLineForFlag[fi];
+      if (stepEnd == null || stepEnd < 0) return;
+      const existing = byStep[stepEnd];
+      if (existing == null) {
+        byStep[stepEnd] = fi;
+        return;
+      }
+      const existingFlag = flags[existing];
+      const currentScore = severityRank[f.severity] || 0;
+      const existingScore = severityRank[existingFlag.severity] || 0;
+      if (currentScore > existingScore) byStep[stepEnd] = fi;
+    });
+    return byStep;
+  })();
+  // Helper to ask "which (single) flag should appear under this displayed line?".
+  const getFlagsToShowAfterLine = (lineIndex) => {
+    const idx = chosenFlagIndexByStepEnd[lineIndex];
+    return typeof idx === "number" ? [flags[idx]] : [];
+  };
+  // Order the chosen flags by where they appear in the protocol (earlier steps first).
+  const sortedFlagIndices = Object.values(chosenFlagIndexByStepEnd)
+    .filter((v, i, arr) => arr.indexOf(v) === i)
     .sort((a, b) => (lastLineForFlag[a] ?? 999999) - (lastLineForFlag[b] ?? 999999));
 
-  const highCount = flags.filter((f, i) => f.severity === "HIGH" && !dismissed.has(i)).length;
-  const medCount  = flags.filter((f, i) => f.severity === "MEDIUM" && !dismissed.has(i)).length;
-  const lowCount  = flags.filter((f, i) => f.severity === "LOW" && !dismissed.has(i)).length;
+  // Summary counts (ignoring dismissed flags) for the header pills,
+  // based only on the single chosen flag per step.
+  const chosenActiveFlags = sortedFlagIndices.map((idx) => ({ flag: flags[idx], idx }))
+    .filter(({ idx }) => !dismissed.has(idx));
+  const highCount = chosenActiveFlags.filter(({ flag }) => flag.severity === "HIGH").length;
+  const medCount  = chosenActiveFlags.filter(({ flag }) => flag.severity === "MEDIUM").length;
+  const lowCount  = chosenActiveFlags.filter(({ flag }) => flag.severity === "LOW").length;
+
+  // Convenience helper for consumers that want the fully updated protocol.
+  const buildUpdatedProtocolText = () => displayedLines.join("\n");
+
+  // Generate a PDF of the updated protocol (with accepted fixes applied),
+  // 1" margins, Times 12, 1.15 spacing, paragraph wrapping, and a
+  // References section built from accepted flags' citations.
+  const exportUpdatedProtocolPdf = () => {
+    let baseText = (displayedLines.length > 0 ? displayedLines.join("\n") : protocolText) || "";
+    if (!baseText.trim()) {
+      setError("No protocol text available to export.");
+      return;
+    }
+    try {
+      const doc = new jsPDF({ unit: "pt", format: "letter" });
+      const oneInch = 72;
+      const margin = oneInch;
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
+      const usableWidth = pageWidth - margin * 2;
+      const fontSize = 12;
+      const lineSpacing = 1.15;
+      const lineHeight = fontSize * lineSpacing;
+
+      // Normalize Unicode subscripts (e.g., H₂O) to plain digits so they
+      // render correctly with the built-in Times font.
+      const subscriptMap = {
+        "\u2080": "0",
+        "\u2081": "1",
+        "\u2082": "2",
+        "\u2083": "3",
+        "\u2084": "4",
+        "\u2085": "5",
+        "\u2086": "6",
+        "\u2087": "7",
+        "\u2088": "8",
+        "\u2089": "9",
+      };
+      baseText = baseText.replace(/[\u2080-\u2089]/g, (ch) => subscriptMap[ch] || ch);
+
+      // Normalize Greek letters that don't render well in built-in Times.
+      // Keep ± as-is, but render common Greek symbols as parenthesized English strings.
+      const greekMap = {
+        "\u03B1": "(alpha)",
+        "\u0391": "(Alpha)",
+        "\u03B2": "(beta)",
+        "\u0392": "(Beta)",
+        "\u03B3": "(gamma)",
+        "\u0393": "(Gamma)",
+        "\u03B4": "(delta)",
+        "\u0394": "(Delta)",
+        "\u03B5": "(epsilon)",
+        "\u0395": "(Epsilon)",
+        "\u03BC": "(mu)",
+        "\u039C": "(Mu)",
+        "\u03C3": "(sigma)",
+        "\u03A3": "(Sigma)",
+        "\u03C9": "(omega)",
+        "\u03A9": "(Omega)"
+      };
+      baseText = baseText.replace(/[\u0391-\u03C9]/g, (ch) => greekMap[ch] || ch);
+
+      let y = margin;
+      doc.setFont("times", "normal");
+      doc.setFontSize(fontSize);
+
+      const header = "Updated Protocol (with accepted fixes applied)";
+      const headerLines = doc.splitTextToSize(header, usableWidth);
+      headerLines.forEach((line) => {
+        if (y + lineHeight > pageHeight - margin) {
+          doc.addPage();
+          y = margin;
+        }
+        doc.text(line, margin, y, { maxWidth: usableWidth });
+        y += lineHeight;
+      });
+
+      y += lineHeight * 0.5;
+      const paragraphs = baseText.split("\n");
+      const lines = [];
+      let firstStepSeen = false;
+      paragraphs.forEach((p) => {
+        const text = p || " ";
+        const trimmed = text.trim();
+        const isStepStart =
+          /^Step\s+\d+/i.test(trimmed) ||
+          /^\d+\.\s+\S/.test(trimmed);
+        // Insert a blank line before every step after the first so that
+        // process steps are visually separated in the exported PDF.
+        if (isStepStart) {
+          if (firstStepSeen) {
+            lines.push("");
+          }
+          firstStepSeen = true;
+        }
+        const wrapped = doc.splitTextToSize(text, usableWidth);
+        lines.push(...wrapped);
+      });
+      lines.forEach((line) => {
+        if (y + lineHeight > pageHeight - margin) {
+          doc.addPage();
+          y = margin;
+        }
+        if (line === "") {
+          // Blank spacer line between steps.
+          y += lineHeight;
+        } else {
+          doc.text(line, margin, y, { maxWidth: usableWidth });
+          y += lineHeight;
+        }
+      });
+
+      // Build references only from accepted, chosen flags (one per step).
+      const refs = [];
+      sortedFlagIndices.forEach((idx) => {
+        const f = flags[idx];
+        if (accepted.has(idx) && f.citation && String(f.citation).trim()) {
+          refs.push(String(f.citation).trim());
+        }
+      });
+      const references = [...new Set(refs)];
+
+      y += lineHeight * 2;
+      if (references.length > 0) {
+        if (y + lineHeight > pageHeight - margin) {
+          doc.addPage();
+          y = margin;
+        }
+        doc.text("References", margin, y);
+        y += lineHeight * 1.5;
+        references.forEach((ref, i) => {
+          const block = (i + 1) + ". " + ref;
+          const refLines = doc.splitTextToSize(block, usableWidth);
+          refLines.forEach((l) => {
+            if (y + lineHeight > pageHeight - margin) {
+              doc.addPage();
+              y = margin;
+            }
+            doc.text(l, margin, y, { maxWidth: usableWidth });
+            y += lineHeight;
+          });
+        });
+      }
+
+      const baseName = pdfFile?.name?.replace(/\.[^.]+$/, "") || "protocol";
+      doc.save(`${baseName}-updated.pdf`);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to generate PDF export.");
+    }
+  };
 
   return (
     <div style={S.app}>
+      {/* Global styles for typography, scrollbars, and small animation helpers. */}
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
         *{box-sizing:border-box;margin:0;padding:0}
@@ -229,6 +519,7 @@ export default function App() {
         .sdot{animation:blink 1.2s ease infinite}
       `}</style>
 
+      {/* Top nav bar with app name and tagline. */}
       <header style={S.header}>
         <div style={S.hInner}>
           <div style={S.logo}>
@@ -240,6 +531,7 @@ export default function App() {
         </div>
       </header>
 
+      {/* ── Upload stage: user selects a protocol PDF for the agent to review. ── */}
       {stage === "upload" && (
         <div style={S.center}>
           <div style={S.card}>
@@ -289,6 +581,7 @@ export default function App() {
         </div>
       )}
 
+      {/* ── Analyzing stage: show streaming "thinking" while the agent runs. ── */}
       {stage === "analyzing" && (
         <div style={S.center}>
           <div style={S.card}>
@@ -313,6 +606,7 @@ export default function App() {
         </div>
       )}
 
+      {/* ── Results stage: updated protocol on the left, triage flags on the right. ── */}
       {stage === "results" && (
         <div style={S.results}>
           <div style={S.summaryBar}>
@@ -326,18 +620,19 @@ export default function App() {
               {medCount  > 0 && <span style={{ ...S.pill, background: "#fef3dc", color: "#c8891a" }}>{medCount} MED</span>}
               {lowCount  > 0 && <span style={{ ...S.pill, background: "#e8f2fb", color: "#2c6e9e" }}>{lowCount} LOW</span>}
               <span style={{ fontSize: 12, color: "#aaa", marginLeft: 4 }}>{flags.length} total</span>
-              <button style={S.resetBtn} onClick={resetApp}>↺ New Analysis</button>
+                <button style={S.exportBtn} onClick={exportUpdatedProtocolPdf}>⬇ Export Updated Protocol (PDF)</button>
+                <button style={S.resetBtn} onClick={resetApp}>↺ New Analysis</button>
             </div>
           </div>
 
           <div style={S.panels}>
             <div style={S.leftPanel}>
               <div style={S.panelHdr}>
-                <span style={S.panelLabel}>EXTRACTED PROTOCOL</span>
+                <span style={S.panelLabel}>UPDATED PROTOCOL</span>
                 <span style={{ fontSize: 11, color: "#bbb", fontFamily: "IBM Plex Mono, monospace", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{pdfFile?.name}</span>
               </div>
               <div style={{ flex: 1, overflowY: "auto", padding: "8px 0" }}>
-                {protocolLines.length > 0 ? protocolLines.map((line, i) => {
+                {displayedLines.length > 0 ? displayedLines.map((line, i) => {
                   const safeLine = line != null ? String(line) : "";
                   const sf = getFlagsToShowAfterLine(i);
                   const isActive = sf.some((f) => flags.indexOf(f) === activeFlag);
@@ -351,7 +646,7 @@ export default function App() {
                         <div style={{ marginLeft: 34, marginTop: 4, display: "flex", flexDirection: "column", gap: 3 }}>
                           {sf.map((f, fi) => {
                             const idx = flags.indexOf(f);
-                            if (dismissed.has(idx)) return null;
+                            if (dismissed.has(idx) || accepted.has(idx)) return null;
                             const cfg = FLAG_CONFIG[f.flag_type] || FLAG_CONFIG.AMBIGUITY;
                             const sev = SEVERITY_CONFIG[f.severity] || SEVERITY_CONFIG.LOW;
                             return (
@@ -375,10 +670,10 @@ export default function App() {
             <div style={S.rightPanel}>
               <div style={S.panelHdr}>
                 <span style={S.panelLabel}>RISK FLAGS</span>
-                <span style={{ fontSize: 11, color: "#bbb" }}>{flags.filter((_, i) => !dismissed.has(i)).length} active</span>
+                <span style={{ fontSize: 11, color: "#bbb" }}>{sortedFlagIndices.filter((idx) => !dismissed.has(idx) && !accepted.has(idx)).length} remaining</span>
               </div>
               <div style={{ flex: 1, overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
-                {sortedFlagIndices.map((idx) => {
+                {sortedFlagIndices.filter((idx) => !accepted.has(idx)).map((idx) => {
                   const flag = flags[idx];
                   const cfg = FLAG_CONFIG[flag.flag_type] || FLAG_CONFIG.AMBIGUITY;
                   const sev = SEVERITY_CONFIG[flag.severity] || SEVERITY_CONFIG.LOW;
@@ -453,6 +748,7 @@ const S = {
   summaryBar: { background: "white", borderBottom: "1px solid #e8e6e0", padding: "12px 24px", display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 },
   pill: { fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 4, letterSpacing: ".06em" },
   resetBtn: { marginLeft: 12, background: "#f4f3ef", border: "1px solid #ddd", borderRadius: 6, padding: "5px 12px", fontSize: 12, cursor: "pointer", color: "#666", fontFamily: "IBM Plex Sans, sans-serif" },
+  exportBtn: { marginLeft: 8, background: "#1a1a1a", border: "none", borderRadius: 6, padding: "6px 12px", fontSize: 11, cursor: "pointer", color: "#fff", fontFamily: "IBM Plex Sans, sans-serif" },
   panels: { display: "flex", flex: 1, overflow: "hidden" },
   leftPanel: { width: "45%", borderRight: "1px solid #e8e6e0", display: "flex", flexDirection: "column", background: "white" },
   rightPanel: { flex: 1, display: "flex", flexDirection: "column", background: "#fafaf8" },
